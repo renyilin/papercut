@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>cut paper</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #2a2a2a; touch-action: none; }
+    .layer { position: fixed; inset: 0; display: block; width: 100%; height: 100%; cursor: crosshair; }
+    .layer.dragging { cursor: grabbing; }
+    .controls-bar {
+      position: fixed;
+      z-index: 10;
+      display: inline-flex;
+      align-items: stretch;
+      gap: 6px;
+      padding: 6px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      user-select: none;
+      -webkit-user-select: none;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .controls-bar.ready {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .mode-toggle-option {
+      border: 0;
+      min-width: 76px;
+      height: 36px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: transparent;
+      color: #575757;
+      font: 600 12px/1 sans-serif;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+    }
+    .mode-toggle-option[data-active="true"] {
+      background: #1f1f1f;
+      color: #f6f1e8;
+      transform: translateY(-1px);
+    }
+    .mode-toggle-option[data-mode="drag"][data-active="true"] {
+      background: #8b6b45;
+      color: #fffaf2;
+    }
+    .mode-toggle-icon {
+      font-size: 18px;
+      line-height: 1;
+      width: 18px;
+      text-align: center;
+      flex: 0 0 18px;
+    }
+    .mode-toggle-label {
+      letter-spacing: 0.01em;
+    }
+    @media (max-width: 768px) {
+      .hint {
+        display: none;
+      }
+    }
+    .refresh-button {
+      border: 0;
+      width: 44px;
+      height: 38px;
+      padding: 0;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.92);
+      color: #2f2a24;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      font: 600 18px/1 sans-serif;
+      cursor: pointer;
+      transition: transform 120ms ease, background-color 120ms ease;
+    }
+    .refresh-button:hover {
+      background: #fffaf2;
+    }
+    .refresh-button:active {
+      transform: translateY(1px);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gl" class="layer"></canvas>
+  <canvas id="overlay" class="layer"></canvas>
+  <script>
+    // =====================================================================
+    // Canvas & WebGL setup
+    // =====================================================================
+
+    const glCanvas = document.getElementById('gl');
+    const overlayCanvas = document.getElementById('overlay');
+    const ctx = overlayCanvas.getContext('2d');       // 2D overlay for torn edges, cut trail, wireframe debug
+    const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true, premultipliedAlpha: true });
+
+    if (!gl) throw new Error('WebGL unavailable');
+
+    let viewportWidth = 0;
+    let viewportHeight = 0;
+    let dpr = 1;
+
+    // WebGL handles (initialized in initGL)
+    let glProgram = null;
+    let glBuffer = null;
+    let glTexture = null;
+    let glTextureImage = null;  // tracks which image is currently bound to avoid redundant uploads
+    let positionLoc = -1;
+    let uvLoc = -1;
+    let resolutionLoc = null;
+
+    function createShader(type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(shader) || 'Shader compile failed');
+      }
+      return shader;
+    }
+
+    // Vertex shader converts pixel coordinates to clip space; fragment shader samples the paper texture.
+    function initGL() {
+      const vertexShader = createShader(gl.VERTEX_SHADER, `
+        attribute vec2 a_position;
+        attribute vec2 a_uv;
+        uniform vec2 u_resolution;
+        varying vec2 v_uv;
+        void main() {
+          vec2 zeroToOne = a_position / u_resolution;
+          vec2 zeroToTwo = zeroToOne * 2.0;
+          vec2 clip = zeroToTwo - 1.0;
+          gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+          v_uv = a_uv;
+        }
+      `);
+      const fragmentShader = createShader(gl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform sampler2D u_texture;
+        void main() {
+          gl_FragColor = texture2D(u_texture, v_uv);
+        }
+      `);
+
+      glProgram = gl.createProgram();
+      gl.attachShader(glProgram, vertexShader);
+      gl.attachShader(glProgram, fragmentShader);
+      gl.linkProgram(glProgram);
+      if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(glProgram) || 'Program link failed');
+      }
+
+      positionLoc = gl.getAttribLocation(glProgram, 'a_position');
+      uvLoc = gl.getAttribLocation(glProgram, 'a_uv');
+      resolutionLoc = gl.getUniformLocation(glProgram, 'u_resolution');
+      glBuffer = gl.createBuffer();
+      glTexture = gl.createTexture();
+
+      // Clamp-to-edge prevents seam artifacts at triangle boundaries.
+      // Premultiplied alpha + ONE/ONE_MINUS_SRC_ALPHA for correct transparency compositing.
+      gl.bindTexture(gl.TEXTURE_2D, glTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.clearColor(0, 0, 0, 0);
+    }
+
+    function ensureTexture(image) {
+      if (glTextureImage === image) return;
+      glTextureImage = image;
+      gl.bindTexture(gl.TEXTURE_2D, glTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    }
+
+    function resize() {
+      viewportWidth = window.innerWidth;
+      viewportHeight = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+      glCanvas.width = Math.round(viewportWidth * dpr);
+      glCanvas.height = Math.round(viewportHeight * dpr);
+      overlayCanvas.width = Math.round(viewportWidth * dpr);
+      overlayCanvas.height = Math.round(viewportHeight * dpr);
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    }
+    window.addEventListener('resize', () => {
+      resize();
+      if (currentImage) init(currentImage);
+    });
+    resize();
+    initGL();
+
+    // =====================================================================
+    // Cloth simulation parameters
+    // =====================================================================
+    // The paper is modelled as a particle-spring grid: COLS wide, ROWS tall.
+    // Each grid intersection is a particle; horizontal, vertical, and diagonal
+    // springs (constraints) hold the mesh together. Cutting breaks springs,
+    // letting pieces separate and fall under gravity.
+
+    const COLS = 80;              // grid columns (fixed)
+    const DAMPING = 0.95;         // velocity damping per tick
+    const GRAVITY = 0.2;          // pixels/tick² downward acceleration
+    const ITERATIONS = 8;         // constraint solver passes per tick
+    const FIXED_DT = 1 / 120;    // physics timestep (120 Hz)
+    const MAX_STEPS = 4;          // max physics steps per frame to avoid spiral-of-death
+
+    let particles = [];           // { x, y, px, py, u, v } — position + previous position + UV coords
+    let constraints = [];         // { a, b, rest, broken } — spring between particle indices
+    let triangles = [];           // rendering triangles with visibility edge references
+    let pinned = new Set();       // indices of particles fixed in place (top row)
+    let ROWS, imgX, imgY, cellW, cellH, drawW = 0, drawH = 0;
+    let accumulator = 0;
+    let lastTime = -1;
+    let currentImage = null;
+    let rafId = null;
+
+    function positionControls() {
+      if (!drawW || !drawH) return;
+      const controlsWidth = controlsBar.offsetWidth;
+      const left = Math.max(12, imgX + drawW - controlsWidth);
+      const desiredTop = imgY - controlsBar.offsetHeight - 18;
+      const top = desiredTop < 4 ? 4 : desiredTop;
+      controlsBar.style.left = `${left}px`;
+      controlsBar.style.top = `${top}px`;
+      controlsBar.classList.add('ready');
+    }
+
+    // Fast lookup: is a given edge (constraint between two particles) broken?
+    // Used by triangle visibility checks during rendering.
+    const constraintByEdge = new Map();
+    function edgeKey(a, b) { return a < b ? a * 100000 + b : b * 100000 + a; }
+    function isEdgeBroken(a, b) {
+      const con = constraintByEdge.get(edgeKey(a, b));
+      return con ? con.broken : true;
+    }
+
+    function isPinnedParticle(i) {
+      return pinned.has(i) || i === draggedParticle;
+    }
+
+    // =====================================================================
+    // Mesh initialization — builds particles, constraints, and triangles
+    // =====================================================================
+
+    function init(image) {
+      if (rafId) cancelAnimationFrame(rafId);
+      currentImage = image;
+
+      // Fit image within viewport with padding, never upscale
+      const horizontalPad = 32;
+      const verticalPad = 108;
+      const maxW = viewportWidth - horizontalPad * 2;
+      const maxH = viewportHeight - verticalPad * 2;
+      const scale = Math.min(maxW / image.width, maxH / image.height, 1);
+      drawW = image.width * scale;
+      drawH = image.height * scale;
+
+      ROWS = Math.round(COLS * (drawH / drawW));
+      imgX = (viewportWidth - drawW) / 2;
+      imgY = verticalPad;
+      cellW = drawW / (COLS - 1);
+      cellH = drawH / (ROWS - 1);
+
+      particles = [];
+      pinned = new Set();
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const x = imgX + c * cellW;
+          const y = imgY + r * cellH;
+          particles.push({ x, y, px: x, py: y, u: c / (COLS - 1), v: r / (ROWS - 1) });
+          if (r === 0) pinned.add(r * COLS + c);
+        }
+      }
+
+      constraints = [];
+      constraintByEdge.clear();
+      function addConstraint(i, j) {
+        const dx = particles[i].x - particles[j].x;
+        const dy = particles[i].y - particles[j].y;
+        const con = { a: i, b: j, rest: Math.hypot(dx, dy), broken: false };
+        constraints.push(con);
+        constraintByEdge.set(edgeKey(i, j), con);
+      }
+
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const i = r * COLS + c;
+          if (c < COLS - 1) addConstraint(i, i + 1);
+          if (r < ROWS - 1) addConstraint(i, i + COLS);
+        }
+      }
+
+      for (let r = 0; r < ROWS - 1; r++) {
+        for (let c = 0; c < COLS - 1; c++) {
+          const tl = r * COLS + c;
+          const tr = tl + 1;
+          const bl = tl + COLS;
+          const br = bl + 1;
+          // Keep one diagonal per cell, but alternate direction so the
+          // wireframe reads as a more even mesh instead of one repeated slash.
+          if ((r + c) % 2 === 0) {
+            addConstraint(tl, br);
+          } else {
+            addConstraint(tr, bl);
+          }
+        }
+      }
+
+      // Each triangle stores: [vertIdx0, vertIdx1, vertIdx2, edge0a, edge0b, edge1a, edge1b]
+      //   - First 3: vertex particle indices for rendering
+      //   - Last 4: two structural edges checked for visibility (horizontal/vertical only)
+      // Diagonal constraints exist for shear stability but are NOT used for
+      // visibility — breaking a diagonal alone shouldn't punch a triangular hole.
+      triangles = [];
+      for (let r = 0; r < ROWS - 1; r++) {
+        for (let c = 0; c < COLS - 1; c++) {
+          const tl = r * COLS + c;
+          const tr = tl + 1;
+          const bl = tl + COLS;
+          const br = bl + 1;
+          if ((r + c) % 2 === 0) {
+            // Diagonal: tl-br  →  upper-right triangle + lower-left triangle
+            triangles.push([tl, tr, br, tl, tr, tr, br]);
+            triangles.push([tl, br, bl, tl, bl, br, bl]);
+          } else {
+            // Diagonal: tr-bl  →  upper-left triangle + lower-right triangle
+            triangles.push([tl, tr, bl, tl, tr, bl, tl]);
+            triangles.push([tr, br, bl, tr, br, br, bl]);
+          }
+        }
+      }
+
+      cutTrail.length = 0;
+      accumulator = 0;
+      lastTime = -1;
+      ensureTexture(image);
+      positionControls();
+      rafId = requestAnimationFrame(renderFrame);
+    }
+
+    // =====================================================================
+    // Rendering — WebGL paper + 2D overlay for torn edges and debug
+    // =====================================================================
+
+    // A triangle is visible only if both of its structural edges are intact.
+    function shouldDrawTriangle(e0a, e0b, e1a, e1b) {
+      return !isEdgeBroken(e0a, e0b) && !isEdgeBroken(e1a, e1b);
+    }
+
+    // Skip collapsed triangles (near-zero area) to avoid rendering artifacts.
+    function isTriangleDegenerate(p0, p1, p2) {
+      const area2 = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+      return Math.abs(area2) < 0.5;
+    }
+
+    // Builds a vertex array from visible triangles and draws them in one batch.
+    function renderPaperGL() {
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      if (!currentImage) return;
+
+      const verts = [];
+      for (const tri of triangles) {
+        if (!shouldDrawTriangle(tri[3], tri[4], tri[5], tri[6])) continue;
+        const p0 = particles[tri[0]], p1 = particles[tri[1]], p2 = particles[tri[2]];
+        if (isTriangleDegenerate(p0, p1, p2)) continue;
+        verts.push(
+          p0.x, p0.y, p0.u, p0.v,
+          p1.x, p1.y, p1.u, p1.v,
+          p2.x, p2.y, p2.u, p2.v
+        );
+      }
+
+      if (!verts.length) return;
+
+      gl.useProgram(glProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+
+      gl.enableVertexAttribArray(positionLoc);
+      gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 16, 0);
+      gl.enableVertexAttribArray(uvLoc);
+      gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 16, 8);
+
+      gl.uniform2f(resolutionLoc, viewportWidth, viewportHeight);
+      gl.bindTexture(gl.TEXTURE_2D, glTexture);
+      gl.drawArrays(gl.TRIANGLES, 0, verts.length / 4);
+    }
+
+    // Draw a pale line along broken constraints to give a torn-paper look.
+    function drawTornEdges() {
+      ctx.strokeStyle = '#e8e0d4';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (const con of constraints) {
+        if (!con.broken) continue;
+        const a = particles[con.a], b = particles[con.b];
+        if (Math.hypot(b.x - a.x, b.y - a.y) > con.rest * 2) continue;
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
+    }
+
+    // =====================================================================
+    // Physics — Verlet integration with distance constraints
+    // =====================================================================
+
+    function simulate() {
+      // If dragging a particle, snap it to the pointer (infinite mass)
+      if (draggedParticle !== -1) {
+        const p = particles[draggedParticle];
+        p.x = dragX;
+        p.y = dragY;
+        p.px = dragX;
+        p.py = dragY;
+      }
+
+      // Verlet integration: velocity is implicit as (position - previous position)
+      for (let i = 0; i < particles.length; i++) {
+        if (isPinnedParticle(i)) continue;
+        const p = particles[i];
+        const vx = (p.x - p.px) * DAMPING;
+        const vy = (p.y - p.py) * DAMPING;
+        p.px = p.x;
+        p.py = p.y;
+        p.x += vx;
+        p.y += vy + GRAVITY;
+      }
+
+      // Iterative constraint relaxation — more iterations = stiffer cloth
+      for (let iter = 0; iter < ITERATIONS; iter++) {
+        for (const con of constraints) {
+          if (con.broken) continue;
+          const a = particles[con.a], b = particles[con.b];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy) || 0.001;
+          const diff = (dist - con.rest) / dist;
+          const aFixed = isPinnedParticle(con.a);
+          const bFixed = isPinnedParticle(con.b);
+          if (aFixed && bFixed) continue;
+          if (aFixed) {
+            b.x -= dx * diff; b.y -= dy * diff;
+          } else if (bFixed) {
+            a.x += dx * diff; a.y += dy * diff;
+          } else {
+            a.x += dx * diff * 0.5; a.y += dy * diff * 0.5;
+            b.x -= dx * diff * 0.5; b.y -= dy * diff * 0.5;
+          }
+        }
+      }
+
+      // Viewport boundary collision with velocity reflection
+      const bounce = 0.3;
+      for (let i = 0; i < particles.length; i++) {
+        if (isPinnedParticle(i)) continue;
+        const p = particles[i];
+        if (p.x < 0) { p.x = 0; p.px = p.x + (p.x - p.px) * bounce; }
+        if (p.x > viewportWidth) { p.x = viewportWidth; p.px = p.x + (p.x - p.px) * bounce; }
+        if (p.y < 0) { p.y = 0; p.py = p.y + (p.y - p.py) * bounce; }
+        if (p.y > viewportHeight) { p.y = viewportHeight; p.py = p.y + (p.y - p.py) * bounce; }
+      }
+    }
+
+    // =====================================================================
+    // Cutting — break constraints near the pointer's swipe path
+    // =====================================================================
+
+    const CUT_RADIUS = 5; // pixels — how wide the cut blade is
+
+    // Minimum distance from point (px,py) to line segment (x1,y1)-(x2,y2).
+    function distToSegment(px, py, x1, y1, x2, y2) {
+      const dx = x2 - x1, dy = y2 - y1;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1e-10) return Math.hypot(px - x1, py - y1);
+      const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
+      return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    }
+
+    // Check if constraint edge is close enough to the pointer movement segment to be cut
+    function shouldCut(con, x1, y1, x2, y2) {
+      const a = particles[con.a], b = particles[con.b];
+      // Check midpoint of constraint against pointer segment
+      const mx = (a.x + b.x) * 0.5, my = (a.y + b.y) * 0.5;
+      if (distToSegment(mx, my, x1, y1, x2, y2) < CUT_RADIUS) return true;
+      // Also check both endpoints for short fast swipes
+      if (distToSegment(a.x, a.y, x1, y1, x2, y2) < CUT_RADIUS) return true;
+      if (distToSegment(b.x, b.y, x1, y1, x2, y2) < CUT_RADIUS) return true;
+      return false;
+    }
+
+    function updatePinned() {
+      // Only the top row is truly pinned — everything else is free
+      // and held up by constraints (sags under gravity)
+      pinned = new Set();
+      for (let c = 0; c < COLS; c++) pinned.add(c);
+    }
+
+    // =====================================================================
+    // Pointer events — cut mode vs drag mode
+    // =====================================================================
+
+    const DRAG_RADIUS = 28; // max distance to grab a particle in drag mode
+
+    let cutPointerDown = false;
+    let dragPointerDown = false;
+    let lastPointerX = 0, lastPointerY = 0;
+    let draggedParticle = -1;
+    let dragX = 0, dragY = 0;
+    let interactionMode = 'cut';  // 'cut' or 'drag'
+
+    function updatePointerCursor() {
+      overlayCanvas.classList.toggle('dragging', dragPointerDown && draggedParticle !== -1);
+      if (!dragPointerDown) {
+        overlayCanvas.style.cursor = interactionMode === 'drag' ? 'grab' : 'crosshair';
+      }
+    }
+
+    function updateModeButton() {
+      cutModeButton.dataset.active = String(interactionMode === 'cut');
+      dragModeButton.dataset.active = String(interactionMode === 'drag');
+    }
+
+    function findNearestParticle(x, y, maxDist = Infinity) {
+      let best = -1;
+      let bestDistSq = maxDist * maxDist;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const dx = p.x - x;
+        const dy = p.y - y;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < bestDistSq) {
+          best = i;
+          bestDistSq = distSq;
+        }
+      }
+      return best;
+    }
+
+    overlayCanvas.addEventListener('pointerdown', (e) => {
+      const wantsDrag = interactionMode === 'drag';
+      if (wantsDrag) {
+        dragPointerDown = true;
+        draggedParticle = findNearestParticle(e.clientX, e.clientY, DRAG_RADIUS);
+        dragX = e.clientX;
+        dragY = e.clientY;
+      } else {
+        cutPointerDown = true;
+      }
+      lastPointerX = e.clientX;
+      lastPointerY = e.clientY;
+      overlayCanvas.setPointerCapture(e.pointerId);
+      if (hint) hint.style.opacity = '0';
+      updatePointerCursor();
+      e.preventDefault();
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      const cx = e.clientX, cy = e.clientY;
+
+      if (dragPointerDown && draggedParticle !== -1) {
+        dragX = cx;
+        dragY = cy;
+      }
+
+      if (!cutPointerDown) {
+        lastPointerX = cx;
+        lastPointerY = cy;
+        return;
+      }
+
+      for (const con of constraints) {
+        if (con.broken) continue;
+        if (shouldCut(con, lastPointerX, lastPointerY, cx, cy)) {
+          con.broken = true;
+        }
+      }
+
+      updatePinned();
+      cutTrail.push({ x: cx, y: cy, age: 0 });
+
+      lastPointerX = cx;
+      lastPointerY = cy;
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (dragPointerDown && interactionMode === 'drag') {
+        dragPointerDown = false;
+        draggedParticle = -1;
+      } else {
+        cutPointerDown = false;
+      }
+      updatePointerCursor();
+    });
+    window.addEventListener('pointercancel', () => {
+      cutPointerDown = false;
+      dragPointerDown = false;
+      draggedParticle = -1;
+      updatePointerCursor();
+    });
+    updatePointerCursor();
+
+    // =====================================================================
+    // Cut trail — fading visual feedback along the swipe path
+    // =====================================================================
+
+    const cutTrail = [];
+
+    function drawCutTrail() {
+      for (let i = cutTrail.length - 1; i >= 0; i--) {
+        cutTrail[i].age += 1;
+        if (cutTrail[i].age > 30) { cutTrail.splice(i, 1); }
+      }
+      if (cutTrail.length < 2) return;
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 1; i < cutTrail.length; i++) {
+        const p0 = cutTrail[i - 1], p1 = cutTrail[i];
+        if (p0.age > p1.age + 5) continue; // gap in trail
+        const alpha = 1 - p1.age / 30;
+        ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.4})`;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+      }
+    }
+
+    // =====================================================================
+    // Keyboard shortcuts & image drop
+    // =====================================================================
+
+    let showEdges = false; // H toggles wireframe debug overlay
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'r' || e.key === 'R') {
+        if (currentImage) init(currentImage);
+      }
+      if (e.key === 'h' || e.key === 'H') {
+        showEdges = !showEdges;
+      }
+      if (e.key === 'm' || e.key === 'M') {
+        interactionMode = interactionMode === 'cut' ? 'drag' : 'cut';
+        updateModeButton();
+        updatePointerCursor();
+      }
+    });
+
+    overlayCanvas.addEventListener('dragover', (e) => { e.preventDefault(); });
+    overlayCanvas.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (!file || !file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const newImg = new Image();
+        newImg.onload = () => init(newImg);
+        newImg.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // =====================================================================
+    // Render loop — fixed-timestep physics, variable-rate rendering
+    // =====================================================================
+
+    function renderFrame(now) {
+      if (lastTime < 0) { lastTime = now; rafId = requestAnimationFrame(renderFrame); return; }
+      const dt = Math.min((now - lastTime) / 1000, MAX_STEPS * FIXED_DT);
+      lastTime = now;
+      accumulator += dt;
+
+      while (accumulator >= FIXED_DT) {
+        simulate();
+        accumulator -= FIXED_DT;
+      }
+
+      renderPaperGL();
+      ctx.clearRect(0, 0, viewportWidth, viewportHeight);
+
+      if (showEdges) {
+        drawTornEdges();
+        // Draw triangle wireframe
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 0.5;
+        for (const tri of triangles) {
+          if (!shouldDrawTriangle(tri[3], tri[4], tri[5], tri[6])) continue;
+          const p0 = particles[tri[0]], p1 = particles[tri[1]], p2 = particles[tri[2]];
+          if (isTriangleDegenerate(p0, p1, p2)) continue;
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.closePath();
+          ctx.stroke();
+        }
+      }
+      drawCutTrail();
+
+      rafId = requestAnimationFrame(renderFrame);
+    }
+
+    // =====================================================================
+    // UI controls — mode toggle bar, refresh button, hint text
+    // =====================================================================
+
+    const controlsBar = document.createElement('div');
+    controlsBar.className = 'controls-bar';
+    const cutModeButton = document.createElement('button');
+    cutModeButton.className = 'mode-toggle-option';
+    cutModeButton.type = 'button';
+    cutModeButton.dataset.mode = 'cut';
+    cutModeButton.innerHTML = '<span class="mode-toggle-icon">✂</span><span class="mode-toggle-label">Cut</span>';
+    cutModeButton.addEventListener('click', () => {
+      interactionMode = 'cut';
+      updateModeButton();
+      updatePointerCursor();
+    });
+    const dragModeButton = document.createElement('button');
+    dragModeButton.className = 'mode-toggle-option';
+    dragModeButton.type = 'button';
+    dragModeButton.dataset.mode = 'drag';
+    dragModeButton.innerHTML = '<span class="mode-toggle-icon">✋</span><span class="mode-toggle-label">Drag</span>';
+    dragModeButton.addEventListener('click', () => {
+      interactionMode = 'drag';
+      updateModeButton();
+      updatePointerCursor();
+    });
+    const refreshButton = document.createElement('button');
+    refreshButton.className = 'refresh-button';
+    refreshButton.type = 'button';
+    refreshButton.setAttribute('aria-label', 'Refresh');
+    refreshButton.title = 'Refresh';
+    refreshButton.textContent = '↻';
+    refreshButton.addEventListener('click', () => {
+      window.location.reload();
+    });
+    controlsBar.append(refreshButton, cutModeButton, dragModeButton);
+    document.body.appendChild(controlsBar);
+    updateModeButton();
+
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = 'swipe to cut \u00b7 use the mode buttons or M to drag \u00b7 R to reset \u00b7 H to toggle edges \u00b7 drop image to replace';
+    hint.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);color:#666;font:14px sans-serif;pointer-events:none;transition:opacity 0.5s';
+    document.body.appendChild(hint);
+
+    // =====================================================================
+    // Bootstrap — load a random image and start the simulation
+    // =====================================================================
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = 'https://picsum.photos/600/400';
+    img.onload = () => init(img);
+  </script>
+</body>
+</html>
