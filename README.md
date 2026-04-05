@@ -4,6 +4,8 @@ Small browser experiment that turns an image into a cuttable sheet of paper.
 
 It renders the image with WebGL, simulates the paper, and lets you slice or drag it apart with pointer input.
 
+See [demo](https://renyilin.github.io/papercut/).
+
 ## Controls
 
 - Swipe or click-drag to cut
