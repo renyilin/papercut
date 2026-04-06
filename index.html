@@ -226,6 +226,7 @@
     let particles = [];           // { x, y, px, py, u, v } — position + previous position + UV coords
     let constraints = [];         // { a, b, rest, broken } — spring between particle indices
     let triangles = [];           // rendering triangles with visibility edge references
+    let particleConstraints = []; // adjacency list of constraints per particle
     let pinned = new Set();       // indices of particles fixed in place (top row)
     let ROWS, imgX, imgY, cellW, cellH, drawW = 0, drawH = 0;
     let accumulator = 0;
@@ -281,12 +282,14 @@
       cellH = drawH / (ROWS - 1);
 
       particles = [];
+      particleConstraints = [];
       pinned = new Set();
       for (let r = 0; r < ROWS; r++) {
         for (let c = 0; c < COLS; c++) {
           const x = imgX + c * cellW;
           const y = imgY + r * cellH;
           particles.push({ x, y, px: x, py: y, u: c / (COLS - 1), v: r / (ROWS - 1) });
+          particleConstraints.push([]);
           if (r === 0) pinned.add(r * COLS + c);
         }
       }
@@ -299,6 +302,8 @@
         const con = { a: i, b: j, rest: Math.hypot(dx, dy), broken: false };
         constraints.push(con);
         constraintByEdge.set(edgeKey(i, j), con);
+        particleConstraints[i].push(con);
+        particleConstraints[j].push(con);
       }
 
       for (let r = 0; r < ROWS; r++) {
@@ -470,6 +475,10 @@
         }
       }
 
+      if (dragPointerDown && interactionMode === 'drag') {
+        maybeTearDraggedComponent();
+      }
+
       // Viewport boundary collision with velocity reflection
       const bounce = 0.3;
       for (let i = 0; i < particles.length; i++) {
@@ -521,6 +530,7 @@
     // =====================================================================
 
     const DRAG_RADIUS = 28; // max distance to grab a particle in drag mode
+    const DRAG_TEAR_THRESHOLD = 0.16; // break the most stretched edge once pull exceeds this ratio
 
     let cutPointerDown = false;
     let dragPointerDown = false;
@@ -555,6 +565,58 @@
         }
       }
       return best;
+    }
+
+    function getDragComponentInfo(startIndex) {
+      if (startIndex < 0) return null;
+      const visited = new Uint8Array(particles.length);
+      const queue = [startIndex];
+      const componentConstraints = new Set();
+      let head = 0;
+      let hasPinned = false;
+      let touchesGround = false;
+      visited[startIndex] = 1;
+
+      while (head < queue.length) {
+        const i = queue[head++];
+        if (pinned.has(i)) hasPinned = true;
+        if (particles[i].y >= viewportHeight - 1) touchesGround = true;
+
+        for (const con of particleConstraints[i]) {
+          if (con.broken) continue;
+          componentConstraints.add(con);
+          const next = con.a === i ? con.b : con.a;
+          if (visited[next]) continue;
+          visited[next] = 1;
+          queue.push(next);
+        }
+      }
+
+      return { hasPinned, touchesGround, componentConstraints };
+    }
+
+    function maybeTearDraggedComponent() {
+      if (draggedParticle === -1) return;
+      const info = getDragComponentInfo(draggedParticle);
+      if (!info || (!info.hasPinned && info.touchesGround)) return;
+
+      let mostStretched = null;
+      let maxStretch = DRAG_TEAR_THRESHOLD;
+      for (const con of info.componentConstraints) {
+        if (con.a === draggedParticle || con.b === draggedParticle) continue;
+        const a = particles[con.a];
+        const b = particles[con.b];
+        const stretch = (Math.hypot(b.x - a.x, b.y - a.y) - con.rest) / con.rest;
+        if (stretch > maxStretch) {
+          maxStretch = stretch;
+          mostStretched = con;
+        }
+      }
+
+      if (mostStretched) {
+        mostStretched.broken = true;
+        updatePinned();
+      }
     }
 
     overlayCanvas.addEventListener('pointerdown', (e) => {
