@@ -12,4 +12,4 @@ See [demo](https://renyilin.github.io/papercut/).
 - Use the on-screen toggle or press `M` to switch between cut and drag modes
 - Press `R` to reset
 - Press `H` to toggle edge debug rendering
-- Default image loads from `https://picsum.photos/600/400`. Drop an image onto the page to replace the default one.
+- Drop an image onto the page to replace the default one.
