@@ -6,7 +6,23 @@
   <title>papercut</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #FFF2D0; touch-action: none; }
+    :root {
+      --ground-y: 100vh;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background:
+        linear-gradient(
+          to bottom,
+          #FFF2D0 0,
+          #FFF2D0 calc(var(--ground-y) - 18px),
+          #E8C27A calc(var(--ground-y) - 2px),
+          #D3A15A 100%
+        );
+      touch-action: none;
+    }
     .layer { position: fixed; inset: 0; display: block; width: 100%; height: 100%; cursor: crosshair; }
     .layer.dragging { cursor: grabbing; }
     .controls-bar {
@@ -107,6 +123,8 @@
     let viewportWidth = 0;
     let viewportHeight = 0;
     let dpr = 1;
+    const MOBILE_BREAKPOINT = 768;
+    const MOBILE_GROUND_LIFT = 30; // keep the resting floor slightly above the viewport bottom on phones
 
     // WebGL handles (initialized in initGL)
     let glProgram = null;
@@ -190,6 +208,7 @@
       viewportWidth = window.innerWidth;
       viewportHeight = window.innerHeight;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
+      document.documentElement.style.setProperty('--ground-y', `${getGroundY()}px`);
 
       glCanvas.width = Math.round(viewportWidth * dpr);
       glCanvas.height = Math.round(viewportHeight * dpr);
@@ -256,6 +275,10 @@
 
     function isPinnedParticle(i) {
       return pinned.has(i) || i === draggedParticle;
+    }
+
+    function getGroundY() {
+      return viewportHeight - (viewportWidth <= MOBILE_BREAKPOINT ? MOBILE_GROUND_LIFT : 0);
     }
 
     // =====================================================================
@@ -481,13 +504,14 @@
 
       // Viewport boundary collision with velocity reflection
       const bounce = 0.3;
+      const groundY = getGroundY();
       for (let i = 0; i < particles.length; i++) {
         if (isPinnedParticle(i)) continue;
         const p = particles[i];
         if (p.x < 0) { p.x = 0; p.px = p.x + (p.x - p.px) * bounce; }
         if (p.x > viewportWidth) { p.x = viewportWidth; p.px = p.x + (p.x - p.px) * bounce; }
         if (p.y < 0) { p.y = 0; p.py = p.y + (p.y - p.py) * bounce; }
-        if (p.y > viewportHeight) { p.y = viewportHeight; p.py = p.y + (p.y - p.py) * bounce; }
+        if (p.y > groundY) { p.y = groundY; p.py = p.y + (p.y - p.py) * bounce; }
       }
     }
 
@@ -580,7 +604,7 @@
       while (head < queue.length) {
         const i = queue[head++];
         if (pinned.has(i)) hasPinned = true;
-        if (particles[i].y >= viewportHeight - 1) touchesGround = true;
+        if (particles[i].y >= getGroundY() - 1) touchesGround = true;
 
         for (const con of particleConstraints[i]) {
           if (con.broken) continue;
