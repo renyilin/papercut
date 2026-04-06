@@ -1,6 +1,6 @@
 # Papercut
 
-Small browser experiment that turns an image into a cuttable sheet of paper.
+Small browser experiment that turns an image into a cuttable and draggable sheet of paper (cloth).
 
 It renders the image with WebGL, simulates the paper, and lets you slice or drag it apart with pointer input.
 
